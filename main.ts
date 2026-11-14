@@ -299,11 +299,16 @@ async function callUpstream(
     return { received: true, ok: true, status: res.status, json: null, stream: res.body };
   }
   const data: unknown = await res.json().catch(() => null);
+  if (!isRecord(data)) {
+    // A 200 with an unparseable or non-object body is unusable: fail this
+    // attempt so the router fails over instead of serving an empty answer.
+    return { received: true, ok: false, status: res.status, json: null, stream: null };
+  }
   return {
     received: true,
     ok: true,
     status: res.status,
-    json: isRecord(data) ? data : null,
+    json: data,
     stream: null,
   };
 }
