@@ -10,6 +10,9 @@
  *   requests across all ten providers under per-provider planning caps
  *   (PLAN_CAPS below, sum 16 — four requests stay unassigned and take
  *   the greedy failover path at runtime), maximising the weighted rating.
+ *   v10: groq trimmed to 1 (its 2nd call is riskier than the greedy
+ *   fallback), pollinations raised to 4 (its 402s are cheap and it has
+ *   the deepest budget); hill-climb winner over 73 trials.
  *   Every provider is used at least once, so every first call — which
  *   always succeeds — is spent productively instead of wasted on a
  *   concentrated greedy order.
@@ -108,13 +111,13 @@ const DEFAULT_CALLS_MAX = 4;
 // for the flow to choose the best assignment. These caps shape ONLY the
 // initial assignment and are never enforced during execution.
 const PLAN_CAPS: Record<string, number> = {
-  groq: 2,
+  groq: 1,
   cerebras: 1,
   gemini: 1,
   zai: 1,
   openrouter: 3,
   sambanova: 1,
-  pollinations: 3,
+  pollinations: 4,
   cloudflare: 1,
   ovh: 1,
   kilol: 2,
