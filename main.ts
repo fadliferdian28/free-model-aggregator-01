@@ -4,17 +4,24 @@
  * One server speaking both OpenAI Chat Completions and Anthropic Messages
  * over ten simulated free-tier providers (openai / anthropic / gemini wires).
  *
- * Routing policy (designed from the kit's published brief + sealed table):
- * - Candidates are (provider, best-free-model) pairs whose capabilities meet
- *   the request's requirements; they are ranked by the quality table's
- *   rating_milli, ties broken by provider id then model id (deterministic).
- * - Planned calls per provider are capped at the published budget maximum
- *   for that provider (CALLS_MAX below). Only the public ranges are used;
- *   the per-trial drawn budgets are never known to this entry.
- * - On a refusal (402/429/5xx) the SAME provider is retried once; a second
- *   consecutive refusal drops the provider for the rest of the trial. A
- *   success resets the consecutive-refusal count. 401/400 answers are
- *   bug-class, never retried on the same provider.
+ * Routing policy (v2: startup planner + greedy failover, designed from the
+ * kit's published brief + sealed table):
+ * - At startup, a planner solves a min-cost assignment of all twenty
+ *   manifest requests across all ten providers under per-provider planning
+ *   caps (PLAN_CAPS below, set from the published budget ranges), maximising
+ *   the weighted rating. Every provider is used at least once, so every
+ *   first call — which always succeeds — is spent productively instead of
+ *   wasted on a concentrated greedy order.
+ * - Each request is served by its planned provider first. On a refusal
+ *   (402/429/5xx) the SAME provider is retried once; a second consecutive
+ *   refusal drops the provider for the rest of the trial, and the request
+ *   fails over to the next best available provider by rating (the greedy
+ *   candidate order). A success resets the consecutive-refusal count.
+ *   401/400 answers are bug-class, never retried on the same provider.
+ * - The planning caps shape ONLY the initial assignment; during execution
+ *   the only per-provider limit is the published budget maximum (CALLS_MAX
+ *   below). Only the public ranges are used; the per-trial drawn budgets
+ *   are never known to this entry.
  * - An OpenAI JSON-mode request is never routed to an anthropic-wire
  *   provider: that wire cannot carry JSON mode, so the echo check would
  *   fail even though the model itself supports JSON.
@@ -90,6 +97,28 @@ const CALLS_MAX: Record<string, number> = {
   kilol: 16,
 };
 const DEFAULT_CALLS_MAX = 4;
+
+// Planning caps per provider (v2): the startup planner assigns at most this
+// many requests to each provider. Set from the published budget ranges, not
+// from any trial's drawn schedule. Small-budget providers are capped at one
+// because their second call fails most often; large-budget providers take up
+// to four because their failure numbers are spread thinly over a long budget.
+// Total planned capacity is 23 for 20 requests, leaving three slots of slack
+// for the flow to choose the best assignment. These caps shape ONLY the
+// initial assignment and are never enforced during execution.
+const PLAN_CAPS: Record<string, number> = {
+  groq: 3,
+  cerebras: 1,
+  gemini: 2,
+  zai: 1,
+  openrouter: 4,
+  sambanova: 1,
+  pollinations: 4,
+  cloudflare: 2,
+  ovh: 1,
+  kilol: 4,
+};
+const DEFAULT_PLAN_CAP = 1;
 const ATTEMPT_TIMEOUT_MS = 8000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const POLL_MS = 100;
@@ -101,6 +130,21 @@ interface Candidate {
   row: RatingRow;
   rating: number;
 }
+
+// One planned slot: the candidate the planner assigned to a manifest
+// request, plus that request's weight (used for the planned-quality total).
+interface PlanSlot {
+  candidate: Candidate;
+  weight: number;
+}
+
+// The startup plan: one planned slot per manifest request index, or null
+// where the planner could not assign the request (serveRouted falls back to
+// the greedy candidate list for those). Computed once by computePlan()
+// after the providers are probed, before serving starts.
+let plan: (PlanSlot | null)[] = [];
+let planEarned = 0;
+let planBound = 0;
 
 interface ProviderState {
   calls: number;
@@ -190,6 +234,50 @@ function servedModels(): ServedModel[] {
   return out;
 }
 
+// The best free model on one provider for a request: the highest-rated free
+// model whose capabilities meet the requirements, ties broken by model id.
+// Null when the provider cannot serve this request (dead, at its budget
+// maximum, wrong capabilities, or the OpenAI-JSON-on-anthropic-wire trap).
+// Shared by the greedy candidate list and the startup planner, so both agree
+// on what each provider can do for each request.
+function bestCandidateForProvider(
+  probe: Probe,
+  requires: Requirement,
+  clientApi: "openai" | "anthropic",
+  jsonMode: boolean,
+): Candidate | null {
+  const st = stateFor(probe.provider.id);
+  if (st.dead || st.calls >= callsMax(probe.provider.id)) return null;
+  // r07 trap: an OpenAI JSON-mode request must never go to an
+  // anthropic-wire provider (that wire cannot carry JSON mode).
+  if (jsonMode && clientApi === "openai" && probe.provider.wire === "anthropic") {
+    return null;
+  }
+  let best: { model: ProbedModel; row: RatingRow; rating: number } | null = null;
+  for (const model of probe.models) {
+    const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+    if (!row) continue;
+    if (!modelFree(model, row)) continue;
+    const caps = capabilitiesOf(model, row);
+    if (!meetsRequirements(requires, caps)) continue;
+    if (
+      !best ||
+      row.rating_milli > best.rating ||
+      (row.rating_milli === best.rating && model.id < best.model.id)
+    ) {
+      best = { model, row, rating: row.rating_milli };
+    }
+  }
+  if (!best) return null;
+  return {
+    probe,
+    provider: probe.provider,
+    model: best.model,
+    row: best.row,
+    rating: best.rating,
+  };
+}
+
 function candidatesFor(
   requires: Requirement,
   clientApi: "openai" | "anthropic",
@@ -198,37 +286,8 @@ function candidatesFor(
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    const st = stateFor(probe.provider.id);
-    if (st.dead || st.calls >= callsMax(probe.provider.id)) continue;
-    // r07 trap: an OpenAI JSON-mode request must never go to an
-    // anthropic-wire provider (that wire cannot carry JSON mode).
-    if (jsonMode && clientApi === "openai" && probe.provider.wire === "anthropic") {
-      continue;
-    }
-    let best: { model: ProbedModel; row: RatingRow; rating: number } | null = null;
-    for (const model of probe.models) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!row) continue;
-      if (!modelFree(model, row)) continue;
-      const caps = capabilitiesOf(model, row);
-      if (!meetsRequirements(requires, caps)) continue;
-      if (
-        !best ||
-        row.rating_milli > best.rating ||
-        (row.rating_milli === best.rating && model.id < best.model.id)
-      ) {
-        best = { model, row, rating: row.rating_milli };
-      }
-    }
-    if (best) {
-      out.push({
-        probe,
-        provider: probe.provider,
-        model: best.model,
-        row: best.row,
-        rating: best.rating,
-      });
-    }
+    const cand = bestCandidateForProvider(probe, requires, clientApi, jsonMode);
+    if (cand) out.push(cand);
   }
   out.sort(
     (a, b) =>
@@ -237,6 +296,171 @@ function candidatesFor(
       (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
   );
   return out;
+}
+
+// Min-cost flow by successive shortest augmenting paths (Bellman-Ford each
+// round; the graph is tiny — 32 nodes, ~200 edges — and has no negative
+// cycles by construction). Edges are [from, to, capacity, cost]. Every
+// augmentation pushes exactly one unit: every source edge has capacity 1,
+// so the bottleneck on any path is 1. Deterministic: edges are relaxed in
+// insertion order with a strict improvement test, so a fixed input order
+// yields a fixed result. Returns the flow value, the total cost, and — for
+// each input edge, in input order — whether it carries flow.
+interface FlowEdge {
+  to: number;
+  rev: number;
+  cap: number;
+  cost: number;
+}
+
+function minCostFlow(
+  nodeCount: number,
+  edges: [number, number, number, number][],
+  source: number,
+  sink: number,
+  maxFlow: number,
+): { flow: number; cost: number; used: boolean[] } {
+  const graph: FlowEdge[][] = Array.from({ length: nodeCount }, () => []);
+  const forwardRef: { from: number; idx: number }[] = [];
+  for (const [from, to, cap, cost] of edges) {
+    const fwd: FlowEdge = { to, rev: graph[to].length, cap, cost };
+    const rev: FlowEdge = { to: from, rev: graph[from].length, cap: 0, cost: -cost };
+    forwardRef.push({ from, idx: graph[from].length });
+    graph[from].push(fwd);
+    graph[to].push(rev);
+  }
+  let flow = 0;
+  let cost = 0;
+  const INF = Number.POSITIVE_INFINITY;
+  while (flow < maxFlow) {
+    const dist: number[] = new Array(nodeCount).fill(INF);
+    const prevNode: number[] = new Array(nodeCount).fill(-1);
+    const prevEdge: number[] = new Array(nodeCount).fill(-1);
+    dist[source] = 0;
+    for (let iter = 0; iter < nodeCount; iter++) {
+      let changed = false;
+      for (let u = 0; u < nodeCount; u++) {
+        if (dist[u] === INF) continue;
+        for (let i = 0; i < graph[u].length; i++) {
+          const e = graph[u][i];
+          if (e.cap > 0 && dist[e.to] > dist[u] + e.cost) {
+            dist[e.to] = dist[u] + e.cost;
+            prevNode[e.to] = u;
+            prevEdge[e.to] = i;
+            changed = true;
+          }
+        }
+      }
+      if (!changed) break;
+    }
+    if (dist[sink] === INF) break;
+    let v = sink;
+    while (v !== source) {
+      const u = prevNode[v];
+      const e = graph[u][prevEdge[v]];
+      e.cap -= 1;
+      graph[v][e.rev].cap += 1;
+      v = u;
+    }
+    flow += 1;
+    cost += dist[sink];
+  }
+  // A forward edge carries flow iff its reverse edge gained capacity.
+  const used: boolean[] = forwardRef.map(({ from, idx }) => {
+    const fwd = graph[from][idx];
+    return graph[fwd.to][fwd.rev].cap > 0;
+  });
+  return { flow, cost, used };
+}
+
+// The startup planner: assigns every manifest request to one provider,
+// maximising the weighted rating under the planning caps. The cost of
+// assigning request r to provider p is -(weight_r * rating of p's best free
+// model meeting r's requirements); a request with no edge to a provider
+// cannot be served there. Runs once, after the providers are probed and
+// before serving starts. Fully deterministic: it depends only on the
+// brief's ratings table and workload manifest and on PLAN_CAPS, so it
+// produces the same assignment on every instance and every replay.
+function computePlan(): void {
+  const manifest = brief.workload?.manifest ?? [];
+  plan = [];
+  planEarned = 0;
+  planBound = 0;
+  if (manifest.length === 0) {
+    console.error("planner: no workload manifest; falling back to greedy routing");
+    return;
+  }
+  const providerIds = [...probes]
+    .filter((p) => p.ok)
+    .map((p) => p.provider.id)
+    .sort();
+  const probeById = new Map(probes.map((p) => [p.provider.id, p]));
+  const providerIndex = new Map(providerIds.map((id, j) => [id, j]));
+  const n = manifest.length;
+  const m = providerIds.length;
+  const source = 0;
+  const sink = n + m + 1;
+  const edges: [number, number, number, number][] = [];
+  for (let i = 0; i < n; i++) edges.push([source, 1 + i, 1, 0]);
+  const edgeIndex = new Map<string, number>();
+  const candByPair = new Map<string, Candidate>();
+  for (let i = 0; i < n; i++) {
+    const req = manifest[i];
+    const jsonMode = req.api === "openai" && req.requires.json === true;
+    for (const pid of providerIds) {
+      const probe = probeById.get(pid);
+      if (!probe) continue;
+      const cand = bestCandidateForProvider(probe, req.requires, req.api, jsonMode);
+      if (!cand) continue;
+      const key = `${i}:${pid}`;
+      edgeIndex.set(key, edges.length);
+      candByPair.set(key, cand);
+      edges.push([1 + i, 1 + n + (providerIndex.get(pid) ?? 0), 1, -(req.weight * cand.rating)]);
+    }
+  }
+  for (let j = 0; j < m; j++) {
+    const cap = PLAN_CAPS[providerIds[j]] ?? DEFAULT_PLAN_CAP;
+    edges.push([1 + n + j, sink, cap, 0]);
+  }
+  const { flow, used } = minCostFlow(sink + 1, edges, source, sink, n);
+  for (let i = 0; i < n; i++) {
+    const req = manifest[i];
+    let slot: PlanSlot | null = null;
+    for (const pid of providerIds) {
+      const key = `${i}:${pid}`;
+      const ei = edgeIndex.get(key);
+      if (ei === undefined || !used[ei]) continue;
+      const cand = candByPair.get(key);
+      if (!cand) continue;
+      slot = { candidate: cand, weight: req.weight };
+      planEarned += req.weight * cand.rating;
+      break;
+    }
+    plan.push(slot);
+  }
+  for (let i = 0; i < n; i++) {
+    const req = manifest[i];
+    let best = 0;
+    for (const pid of providerIds) {
+      const cand = candByPair.get(`${i}:${pid}`);
+      if (cand && cand.rating > best) best = cand.rating;
+    }
+    planBound += req.weight * best;
+  }
+  const quality = planBound > 0 ? Math.floor((100 * planEarned) / planBound) : 0;
+  console.error(
+    `planner: assigned ${flow}/${n} requests, planned earned ${planEarned}/${planBound} (quality ${quality})`,
+  );
+  if (flow < n) {
+    console.error("planner: WARNING — some requests unassigned; greedy fallback will serve them");
+  }
+  for (let i = 0; i < n; i++) {
+    const slot = plan[i];
+    const req = manifest[i];
+    console.error(
+      `planner: ${req.id} (wt ${req.weight}) -> ${slot ? `${slot.candidate.provider.id}/${slot.candidate.model.id} (${slot.candidate.rating})` : "UNASSIGNED"}`,
+    );
+  }
 }
 
 async function callUpstream(
@@ -429,6 +653,20 @@ async function serveRouted(
       : requirementsFromBody(body);
   const jsonMode = clientApi === "openai" ? isJsonMode(body) : false;
   const cands = candidatesFor(requires, clientApi, jsonMode);
+  // v2: the planned candidate for this request goes first; the greedy list
+  // (minus the planned provider, already tried) is the failover order. If
+  // the planned provider is absent from the greedy list (dead or at its
+  // budget maximum), the greedy order serves as-is.
+  const slot = idx < plan.length ? plan[idx] : null;
+  if (slot) {
+    const plannedPos = cands.findIndex(
+      (c) => c.provider.id === slot.candidate.provider.id,
+    );
+    if (plannedPos > 0) {
+      const [planned] = cands.splice(plannedPos, 1);
+      cands.unshift(planned);
+    }
+  }
   for (const cand of cands) {
     const st = stateFor(cand.provider.id);
     if (st.dead) continue;
@@ -580,6 +818,7 @@ async function start(): Promise<void> {
     process.stdout.write(JSON.stringify(catalog) + "\n");
     process.exit(0);
   }
+  computePlan();
   const server = http.createServer((req, res) => {
     void handle(req, res);
   });
