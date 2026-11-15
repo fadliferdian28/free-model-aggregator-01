@@ -8,7 +8,7 @@
  * designed from the kit's published brief + sealed table):
  * - At startup, a planner solves a min-cost assignment of the manifest
  *   requests across all ten providers under per-provider planning caps
- *   (PLAN_CAPS below, sum 17 — three requests stay unassigned and take
+ *   (PLAN_CAPS below, sum 16 — four requests stay unassigned and take
  *   the greedy failover path at runtime), maximising the weighted rating.
  *   Every provider is used at least once, so every first call — which
  *   always succeeds — is spent productively instead of wasted on a
@@ -117,7 +117,7 @@ const PLAN_CAPS: Record<string, number> = {
   pollinations: 3,
   cloudflare: 1,
   ovh: 1,
-  kilol: 3,
+  kilol: 2,
 };
 const DEFAULT_PLAN_CAP = 1;
 const ATTEMPT_TIMEOUT_MS = 8000;
