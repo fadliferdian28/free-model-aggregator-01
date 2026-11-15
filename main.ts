@@ -4,20 +4,21 @@
  * One server speaking both OpenAI Chat Completions and Anthropic Messages
  * over ten simulated free-tier providers (openai / anthropic / gemini wires).
  *
- * Routing policy (v2: startup planner + greedy failover, designed from the
- * kit's published brief + sealed table):
- * - At startup, a planner solves a min-cost assignment of all twenty
- *   manifest requests across all ten providers under per-provider planning
- *   caps (PLAN_CAPS below, set from the published budget ranges), maximising
- *   the weighted rating. Every provider is used at least once, so every
- *   first call — which always succeeds — is spent productively instead of
- *   wasted on a concentrated greedy order.
+ * Routing policy (v3: tight startup planner + retry-twice failover,
+ * designed from the kit's published brief + sealed table):
+ * - At startup, a planner solves a min-cost assignment of the manifest
+ *   requests across all ten providers under per-provider planning caps
+ *   (PLAN_CAPS below, sum 17 — three requests stay unassigned and take
+ *   the greedy failover path at runtime), maximising the weighted rating.
+ *   Every provider is used at least once, so every first call — which
+ *   always succeeds — is spent productively instead of wasted on a
+ *   concentrated greedy order.
  * - Each request is served by its planned provider first. On a refusal
- *   (402/429/5xx) the SAME provider is retried once; a second consecutive
- *   refusal drops the provider for the rest of the trial, and the request
- *   fails over to the next best available provider by rating (the greedy
- *   candidate order). A success resets the consecutive-refusal count.
- *   401/400 answers are bug-class, never retried on the same provider.
+ *   (402/429/5xx) the SAME provider is retried up to twice; a third
+ *   consecutive refusal drops the provider for the rest of the trial, and
+ *   the request fails over to the next best available provider by rating
+ *   (the greedy candidate order). A success resets the consecutive-refusal
+ *   count. 401/400 answers are bug-class, never retried on the same provider.
  * - The planning caps shape ONLY the initial assignment; during execution
  *   the only per-provider limit is the published budget maximum (CALLS_MAX
  *   below). Only the public ranges are used; the per-trial drawn budgets
@@ -107,16 +108,16 @@ const DEFAULT_CALLS_MAX = 4;
 // for the flow to choose the best assignment. These caps shape ONLY the
 // initial assignment and are never enforced during execution.
 const PLAN_CAPS: Record<string, number> = {
-  groq: 3,
+  groq: 2,
   cerebras: 1,
-  gemini: 2,
+  gemini: 1,
   zai: 1,
-  openrouter: 4,
+  openrouter: 3,
   sambanova: 1,
-  pollinations: 4,
-  cloudflare: 2,
+  pollinations: 3,
+  cloudflare: 1,
   ovh: 1,
-  kilol: 4,
+  kilol: 3,
 };
 const DEFAULT_PLAN_CAP = 1;
 const ATTEMPT_TIMEOUT_MS = 8000;
@@ -670,7 +671,7 @@ async function serveRouted(
   for (const cand of cands) {
     const st = stateFor(cand.provider.id);
     if (st.dead) continue;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (st.calls >= callsMax(cand.provider.id)) {
         st.dead = true;
         break;
@@ -685,11 +686,11 @@ async function serveRouted(
       // 401/400 are bug-class: never retry on the same provider.
       if (up.status === 401 || up.status === 400) break;
       st.consecutive += 1;
-      if (st.consecutive >= 2) {
+      if (st.consecutive >= 3) {
         st.dead = true;
         break;
       }
-      // otherwise retry the same provider once (loop continues)
+      // otherwise retry the same provider again (up to two retries)
     }
   }
   if (clientApi === "openai") {
